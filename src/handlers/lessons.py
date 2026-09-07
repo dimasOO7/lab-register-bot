@@ -11,6 +11,7 @@ from src.keyboards.reply import get_main_keyboard, get_cancel_keyboard, get_skip
 from src.keyboards.inline import get_lessons_keyboard, get_delete_confirm_keyboard
 from src.utils.date_parser import parse_lesson_datetime
 from src.config import settings
+from src.services.schedule_sync import sync_schedule
 
 router = Router(name="lessons")
 
@@ -21,11 +22,12 @@ async def render_lessons_list(user_id: int, repo: Repository) -> tuple[str, Inli
         text = (
             "📅 <b>Список пар пуст</b>\n\n"
             "На данный момент нет активных пар для записи на лабораторные.\n"
-            "Вы можете создать новую пару с помощью кнопки ниже."
+            "Вы можете загрузить лабораторные из расписания или создать пару вручную."
         )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Создать пару", callback_data="lesson_create")],
+                [InlineKeyboardButton(text="🔄 Загрузить из расписания", callback_data="lessons_sync")],
+                [InlineKeyboardButton(text="➕ Создать пару вручную", callback_data="lesson_create")],
                 [InlineKeyboardButton(text="🔄 Обновить", callback_data="lessons_refresh")],
             ]
         )
@@ -60,6 +62,49 @@ async def show_lessons_callback(callback: CallbackQuery, repo: Repository):
     except Exception:
         pass
     await callback.answer("🔄 Список пар обновлен")
+
+
+@router.message(Command("sync"))
+@router.callback_query(F.data == "lessons_sync")
+async def sync_schedule_handler(event: Message | CallbackQuery, repo: Repository):
+    user_id = event.from_user.id
+    if not settings.is_admin(user_id):
+        msg = "⛔ Синхронизация расписания доступна только администраторам."
+        if isinstance(event, CallbackQuery):
+            await event.answer(msg, show_alert=True)
+        else:
+            await event.answer(msg)
+        return
+
+    if isinstance(event, CallbackQuery):
+        await event.answer("🔄 Загружаю расписание...")
+        status_msg = await event.message.answer("⏳ Синхронизирую лабораторные работы из расписания...")
+    else:
+        status_msg = await event.answer("⏳ Синхронизирую лабораторные работы из расписания...")
+
+    try:
+        added, total = await sync_schedule(
+            repo=repo,
+            ics_url=settings.schedule_ics_url,
+            default_slots=settings.default_lab_slots,
+        )
+        res_text = (
+            f"✅ <b>Синхронизация расписания завершена!</b>\n\n"
+            f"• Лабораторных в расписании (тек. + след. неделя): <b>{total}</b>\n"
+            f"• Добавлено новых пар в бота: <b>{added}</b>\n\n"
+            "<i>(Уже существующие и ранее удаленные пары сохранены без изменений)</i>"
+        )
+    except Exception as e:
+        res_text = f"❌ <b>Ошибка при загрузке расписания:</b>\n<code>{e}</code>"
+
+    await status_msg.edit_text(res_text, parse_mode="HTML")
+
+    if isinstance(event, CallbackQuery):
+        text, kb = await render_lessons_list(user_id, repo)
+        try:
+            await event.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
 
 
 # ================= LESSON CREATION FSM =================
@@ -149,7 +194,7 @@ async def process_datetime(message: Message, state: FSMContext):
     await state.update_data(datetime_str=display_str, lesson_date=date_iso)
     await state.set_state(LessonForm.description)
     await message.answer(
-        "📍 <b>Шаг 3 из 4: Дополнительная информация</b>\n\n"
+        "📍 <b>Шаг 3 из 3: Дополнительная информация</b>\n\n"
         "Укажите аудиторию, преподавателя или ссылку на материалы (например: <i>ауд. 312, преп. Смирнов А.В.</i>).\n"
         "Если дополнительной информации нет, нажмите <b>«⏭️ Пропустить»</b>:",
         parse_mode="HTML",
@@ -158,43 +203,17 @@ async def process_datetime(message: Message, state: FSMContext):
 
 
 @router.message(LessonForm.description, F.text)
-async def process_description(message: Message, state: FSMContext):
+async def process_description(message: Message, state: FSMContext, repo: Repository):
     desc_text = message.text.strip()
     if desc_text in ["⏭️ Пропустить", "пропустить", "/skip"]:
         description = None
     else:
         description = desc_text
 
-    await state.update_data(description=description)
-    await state.set_state(LessonForm.max_slots)
-    await message.answer(
-        "🔢 <b>Шаг 4 из 4: Количество мест в очереди</b>\n\n"
-        "Укажите максимальное количество слотов для сдачи (например: <code>20</code>).\n"
-        "Либо нажмите <b>«⏭️ Пропустить»</b>, чтобы установить значение по умолчанию (30 мест):",
-        parse_mode="HTML",
-        reply_markup=get_skip_keyboard(),
-    )
-
-
-@router.message(LessonForm.max_slots, F.text)
-async def process_max_slots(message: Message, state: FSMContext, repo: Repository):
-    raw_text = message.text.strip()
-    if raw_text in ["⏭️ Пропустить", "пропустить", "/skip"]:
-        max_slots = 30
-    else:
-        if not raw_text.isdigit():
-            await message.answer("⚠️ Пожалуйста, введите целое положительное число (например: 25) или нажмите «⏭️ Пропустить»:")
-            return
-        max_slots = int(raw_text)
-        if max_slots < 1 or max_slots > 200:
-            await message.answer("⚠️ Количество мест должно быть в диапазоне от 1 до 200. Попробуйте ещё раз:")
-            return
-
     data = await state.get_data()
     subject = data["subject"]
     datetime_str = data["datetime_str"]
     lesson_date = data["lesson_date"]
-    description = data.get("description")
     user_id = message.from_user.id
 
     # Register user in DB if not already registered
@@ -208,7 +227,7 @@ async def process_max_slots(message: Message, state: FSMContext, repo: Repositor
         datetime_str=datetime_str,
         lesson_date=lesson_date,
         description=description,
-        max_slots=max_slots,
+        max_slots=100,
         created_by=user_id,
     )
 
@@ -219,10 +238,9 @@ async def process_max_slots(message: Message, state: FSMContext, repo: Repositor
     summary_text = (
         "✅ <b>Пара успешно добавлена!</b>\n\n"
         f"📚 <b>Предмет:</b> {subject}\n"
-        f"📅 <b>Дата и время:</b> {datetime_str}{desc_info}\n"
-        f"👥 <b>Мест в очереди:</b> {max_slots}\n\n"
+        f"📅 <b>Дата и время:</b> {datetime_str}{desc_info}\n\n"
         "<i>Студенты теперь могут записываться на эту пару. "
-        "Пара будет автоматически удалена в конце дня проведения.</i>"
+        "Очередь формируется динамически. Пара будет автоматически удалена в конце дня проведения.</i>"
     )
 
     action_kb = InlineKeyboardMarkup(

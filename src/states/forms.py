@@ -10,3 +10,7 @@ class LessonForm(StatesGroup):
     datetime_str = State()
     description = State()
     max_slots = State()
+
+
+class QueueSlotForm(StatesGroup):
+    waiting_for_slot = State()

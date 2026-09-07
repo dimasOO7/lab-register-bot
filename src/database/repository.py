@@ -70,16 +70,17 @@ class Repository:
         description: Optional[str],
         max_slots: int,
         created_by: int,
+        external_id: Optional[str] = None,
     ) -> Lesson:
         query = """
-        INSERT INTO lessons (subject, datetime_str, lesson_date, description, max_slots, created_by)
-        VALUES (?, ?, ?, ?, ?, ?)
-        RETURNING id, subject, datetime_str, lesson_date, description, max_slots, is_active, created_by, created_at;
+        INSERT INTO lessons (subject, datetime_str, lesson_date, description, max_slots, created_by, external_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        RETURNING id, subject, datetime_str, lesson_date, description, max_slots, is_active, created_by, created_at, external_id;
         """
         async with self._get_conn() as conn:
             cursor = await conn.execute(
                 query,
-                (subject.strip(), datetime_str.strip(), lesson_date.strip(), description, max_slots, created_by),
+                (subject.strip(), datetime_str.strip(), lesson_date.strip(), description, max_slots, created_by, external_id),
             )
             row = await cursor.fetchone()
             await conn.commit()
@@ -93,11 +94,12 @@ class Repository:
                 is_active=bool(row["is_active"]),
                 created_by=row["created_by"],
                 created_at=row["created_at"],
+                external_id=row["external_id"],
             )
 
     async def get_lesson_by_id(self, lesson_id: int) -> Optional[Lesson]:
         query = """
-        SELECT id, subject, datetime_str, lesson_date, description, max_slots, is_active, created_by, created_at
+        SELECT id, subject, datetime_str, lesson_date, description, max_slots, is_active, created_by, created_at, external_id
         FROM lessons
         WHERE id = ?;
         """
@@ -116,6 +118,7 @@ class Repository:
                 is_active=bool(row["is_active"]),
                 created_by=row["created_by"],
                 created_at=row["created_at"],
+                external_id=row["external_id"],
             )
 
     async def get_active_lessons(self, auto_cleanup: bool = True) -> List[Lesson]:
@@ -123,7 +126,7 @@ class Repository:
             await self.cleanup_expired_lessons()
 
         query = """
-        SELECT id, subject, datetime_str, lesson_date, description, max_slots, is_active, created_by, created_at
+        SELECT id, subject, datetime_str, lesson_date, description, max_slots, is_active, created_by, created_at, external_id
         FROM lessons
         WHERE is_active = 1
         ORDER BY lesson_date ASC, id ASC;
@@ -142,16 +145,90 @@ class Repository:
                     is_active=bool(row["is_active"]),
                     created_by=row["created_by"],
                     created_at=row["created_at"],
+                    external_id=row["external_id"],
                 )
                 for row in rows
             ]
 
     async def delete_lesson(self, lesson_id: int) -> bool:
-        query = "DELETE FROM lessons WHERE id = ?;"
         async with self._get_conn() as conn:
-            cursor = await conn.execute(query, (lesson_id,))
+            cursor = await conn.execute("SELECT external_id FROM lessons WHERE id = ?;", (lesson_id,))
+            row = await cursor.fetchone()
+            if row and row["external_id"]:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO deleted_external_events (external_id) VALUES (?);",
+                    (row["external_id"],),
+                )
+            del_cursor = await conn.execute("DELETE FROM lessons WHERE id = ?;", (lesson_id,))
             await conn.commit()
-            return cursor.rowcount > 0
+            return del_cursor.rowcount > 0
+
+    async def sync_external_lesson(
+        self,
+        subject: str,
+        datetime_str: str,
+        lesson_date: str,
+        description: Optional[str],
+        max_slots: int,
+        created_by: int,
+        external_id: str,
+    ) -> Tuple[bool, Optional[Lesson]]:
+        async with self._get_conn() as conn:
+            # If previously deleted by admin, do not recreate
+            c_del = await conn.execute(
+                "SELECT external_id FROM deleted_external_events WHERE external_id = ?;",
+                (external_id,),
+            )
+            if await c_del.fetchone():
+                return False, None
+
+            # If already exists, return existing
+            c_exist = await conn.execute(
+                """
+                SELECT id, subject, datetime_str, lesson_date, description, max_slots, is_active, created_by, created_at, external_id
+                FROM lessons WHERE external_id = ?;
+                """,
+                (external_id,),
+            )
+            row = await c_exist.fetchone()
+            if row:
+                return False, Lesson(
+                    id=row["id"],
+                    subject=row["subject"],
+                    datetime_str=row["datetime_str"],
+                    lesson_date=row["lesson_date"],
+                    description=row["description"],
+                    max_slots=row["max_slots"],
+                    is_active=bool(row["is_active"]),
+                    created_by=row["created_by"],
+                    created_at=row["created_at"],
+                    external_id=row["external_id"],
+                )
+
+            # Insert newly discovered lesson
+            query = """
+            INSERT INTO lessons (subject, datetime_str, lesson_date, description, max_slots, created_by, external_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            RETURNING id, subject, datetime_str, lesson_date, description, max_slots, is_active, created_by, created_at, external_id;
+            """
+            cursor = await conn.execute(
+                query,
+                (subject.strip(), datetime_str.strip(), lesson_date.strip(), description, max_slots, created_by, external_id),
+            )
+            row_ins = await cursor.fetchone()
+            await conn.commit()
+            return True, Lesson(
+                id=row_ins["id"],
+                subject=row_ins["subject"],
+                datetime_str=row_ins["datetime_str"],
+                lesson_date=row_ins["lesson_date"],
+                description=row_ins["description"],
+                max_slots=row_ins["max_slots"],
+                is_active=bool(row_ins["is_active"]),
+                created_by=row_ins["created_by"],
+                created_at=row_ins["created_at"],
+                external_id=row_ins["external_id"],
+            )
 
     async def cleanup_expired_lessons(self) -> int:
         """
@@ -219,18 +296,22 @@ class Repository:
     async def join_queue_at_position(self, lesson_id: int, user_id: int, position: int) -> Tuple[bool, str]:
         """
         Assigns user to a specific slot number `position`.
-        If position is occupied by another student -> (False, "Место уже занято")
+        Users can choose any positive slot number (including beyond last_occupied + 1).
+        If position is occupied by another student -> (False, "Место уже занято...")
         If user is already on this position -> (True, "Вы уже записаны на это место")
         If user is on another position -> moves user to this position.
         If user is not in queue -> assigns user to this position.
         """
+        if position < 1 or position > 200:
+            return False, "Номер места должен быть числом от 1 до 200."
+
         async with self._get_conn() as conn:
             # Check who occupies this position
-            cursor = await conn.execute(
-                "SELECT user_id FROM queue_entries WHERE lesson_id = ? AND position = ?;",
+            cursor_occupied = await conn.execute(
+                "SELECT position, user_id FROM queue_entries WHERE lesson_id = ? AND position = ?;",
                 (lesson_id, position),
             )
-            row = await cursor.fetchone()
+            row = await cursor_occupied.fetchone()
             if row:
                 if row["user_id"] == user_id:
                     return True, f"Вы уже находитесь на месте #{position}"
@@ -277,13 +358,6 @@ class Repository:
                 pos = user_row["position"]
                 return False, f"Вы уже записаны в эту очередь на место #{pos}!", pos
 
-            # Get lesson max slots
-            cursor_lesson = await conn.execute("SELECT max_slots FROM lessons WHERE id = ?;", (lesson_id,))
-            lesson_row = await cursor_lesson.fetchone()
-            if not lesson_row:
-                return False, "Пара не найдена!", None
-            max_slots = lesson_row["max_slots"]
-
             # Get all currently occupied positions
             cursor_occupied = await conn.execute(
                 "SELECT position FROM queue_entries WHERE lesson_id = ? ORDER BY position ASC;",
@@ -297,10 +371,7 @@ class Repository:
             while first_free in occupied_set:
                 first_free += 1
 
-            if first_free > max_slots:
-                return False, f"К сожалению, все {max_slots} мест заняты!", None
-
-            # Insert at first_free
+            # Insert at first_free (unlimited growth as needed)
             await conn.execute(
                 "INSERT INTO queue_entries (lesson_id, user_id, position) VALUES (?, ?, ?);",
                 (lesson_id, user_id, first_free),

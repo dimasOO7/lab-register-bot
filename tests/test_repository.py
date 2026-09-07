@@ -83,10 +83,10 @@ async def test_queue_slot_take_and_collision(repo: Repository):
         created_by=1,
     )
 
-    # Student 1 takes slot 3
+    # Student 1 takes slot 3 directly
     ok, msg = await repo.join_queue_at_position(lesson.id, user_id=1, position=3)
     assert ok is True
-    assert "успешно записались" in msg
+    assert "успешно записались на место #3" in msg
 
     # Student 2 tries to take occupied slot 3
     ok2, msg2 = await repo.join_queue_at_position(lesson.id, user_id=2, position=3)
@@ -120,24 +120,24 @@ async def test_queue_move_slot(repo: Repository):
         created_by=1,
     )
 
-    # Takes slot 2
-    await repo.join_queue_at_position(lesson.id, user_id=1, position=2)
+    # Takes slot 1
+    await repo.join_queue_at_position(lesson.id, user_id=1, position=1)
     entry = await repo.get_user_entry(lesson.id, user_id=1)
-    assert entry.position == 2
+    assert entry.position == 1
 
-    # Moves to slot 4
-    ok, msg = await repo.join_queue_at_position(lesson.id, user_id=1, position=4)
+    # Moves to slot 2 (allowed: 1 + 1 = 2)
+    ok, msg = await repo.join_queue_at_position(lesson.id, user_id=1, position=2)
     assert ok is True
     assert "переместились" in msg
 
     entry = await repo.get_user_entry(lesson.id, user_id=1)
-    assert entry.position == 4
+    assert entry.position == 2
 
-    # Slot 2 is now free
+    # Slot 1 is now free
     queue = await repo.get_queue_for_lesson(lesson.id)
     positions = [q.position for q in queue]
-    assert 2 not in positions
-    assert 4 in positions
+    assert 1 not in positions
+    assert 2 in positions
 
 
 @pytest.mark.asyncio
@@ -164,24 +164,27 @@ async def test_queue_first_free_slot(repo: Repository):
     assert ok is True
     assert pos == 1
 
-    # Student 2 manually takes slot 3 (leaving slot 2 free!)
-    await repo.join_queue_at_position(lesson.id, user_id=2, position=3)
+    # Student 2 takes next slot 2 (1 + 1 = 2)
+    await repo.join_queue_at_position(lesson.id, user_id=2, position=2)
 
-    # Student 3 uses fast sign up -> should get slot 2 (first free!)
+    # Student 1 leaves queue (slot 1 is now free, slot 2 is occupied)
+    await repo.leave_queue(lesson.id, user_id=1)
+
+    # Student 3 uses fast sign up -> should fill gap at slot 1!
     ok3, msg3, pos3 = await repo.join_queue_at_first_free(lesson.id, user_id=3)
     assert ok3 is True
-    assert pos3 == 2
+    assert pos3 == 1
 
-    # Student 1 tries fast sign up again -> already in queue
-    ok_dup, msg_dup, _ = await repo.join_queue_at_first_free(lesson.id, user_id=1)
+    # Student 3 tries fast sign up again -> already in queue
+    ok_dup, msg_dup, _ = await repo.join_queue_at_first_free(lesson.id, user_id=3)
     assert ok_dup is False
     assert "уже записаны" in msg_dup
 
-    # Now all 3 slots (1, 2, 3) are taken. User 4 attempts fast sign up
+    # Now positions 1 and 2 are occupied. Student 4 signs up -> gets position 3 (unlimited growth)
     await repo.upsert_user(4, "stud4", "Студент 4")
-    ok_full, msg_full, _ = await repo.join_queue_at_first_free(lesson.id, user_id=4)
-    assert ok_full is False
-    assert "все 3 мест заняты" in msg_full
+    ok_grow, msg_grow, pos_grow = await repo.join_queue_at_first_free(lesson.id, user_id=4)
+    assert ok_grow is True
+    assert pos_grow == 3
 
 
 @pytest.mark.asyncio

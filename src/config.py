@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     admin_ids_raw: Union[str, List[int], int] = Field(default="", validation_alias="admin_ids")
     db_path: str = "data/bot.db"
     allow_anyone_create_lessons: bool = True
+    schedule_ics_url: str = "https://stud.l9labs.ru/ics/772107317.ics"
+    default_lab_slots: int = 15
+    sync_interval_hours: int = 6
 
     @computed_field
     @property

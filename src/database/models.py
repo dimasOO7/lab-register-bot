@@ -21,6 +21,7 @@ class Lesson:
     is_active: bool
     created_by: int
     created_at: str
+    external_id: Optional[str] = None
 
 
 @dataclass

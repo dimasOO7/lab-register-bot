@@ -8,14 +8,15 @@ def get_lessons_keyboard(lessons: List[Lesson], counts: Dict[int, int]) -> Inlin
     buttons = []
     for lesson in lessons:
         occupied = counts.get(lesson.id, 0)
-        btn_text = f"📚 {lesson.subject} | {lesson.datetime_str} ({occupied}/{lesson.max_slots})"
+        btn_text = f"📚 {lesson.subject} | {lesson.datetime_str} ({occupied} чел.)"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"lesson_view:{lesson.id}")])
 
-    bottom_row = [
+    action_row = [
         InlineKeyboardButton(text="➕ Добавить пару", callback_data="lesson_create"),
-        InlineKeyboardButton(text="🔄 Обновить", callback_data="lessons_refresh"),
+        InlineKeyboardButton(text="🔄 Синхронизировать", callback_data="lessons_sync"),
     ]
-    buttons.append(bottom_row)
+    buttons.append(action_row)
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data="lessons_refresh")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -72,18 +73,20 @@ def get_queue_keyboard(
 
 def get_slots_keyboard(
     lesson_id: int,
-    max_slots: int,
     queue_entries: List[QueueEntry],
     current_user_id: int,
     page: int = 1,
     per_page: int = 10,
 ) -> InlineKeyboardMarkup:
     occupied_map: Dict[int, QueueEntry] = {e.position: e for e in queue_entries}
-    total_pages = max(1, math.ceil(max_slots / per_page))
+    max_occupied = max(occupied_map.keys()) if occupied_map else 0
+    total_slots = max_occupied + 1
+
+    total_pages = max(1, math.ceil(total_slots / per_page))
     page = max(1, min(page, total_pages))
 
     start_slot = (page - 1) * per_page + 1
-    end_slot = min(page * per_page, max_slots)
+    end_slot = min(page * per_page, total_slots)
 
     buttons = []
     # 2 buttons per row for slots
